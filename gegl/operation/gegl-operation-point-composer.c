@@ -22,6 +22,7 @@
 #include <glib-object.h>
 
 #include "gegl.h"
+#include "gegl-debug.h"
 #include "gegl-operation-point-composer.h"
 #include "gegl-operation-context.h"
 #include "gegl-config.h"
@@ -29,6 +30,9 @@
 #include <sys/types.h>
 #include <unistd.h>
 #include <string.h>
+
+#include "opencl/gegl-cl.h"
+#include "gegl-buffer-cl-iterator.h"
 
 typedef struct ThreadData
 {
@@ -179,6 +183,69 @@ static void prepare (GeglOperation *operation)
   gegl_operation_set_format (operation, "output", format);
 }
 
+static gboolean
+gegl_operation_point_composer_cl_process (GeglOperation       *operation,
+                                          GeglBuffer          *input,
+                                          GeglBuffer          *aux,
+                                          GeglBuffer          *output,
+                                          const GeglRectangle *result,
+                                          gint                 level)
+{
+  const Babl *in_format  = gegl_operation_get_format (operation, "input");
+  const Babl *aux_format = gegl_operation_get_format (operation, "aux");
+  const Babl *out_format = gegl_operation_get_format (operation, "output");
+
+  GeglOperationClass *operation_class = GEGL_OPERATION_GET_CLASS (operation);
+  GeglOperationPointComposerClass *point_composer_class = GEGL_OPERATION_POINT_COMPOSER_GET_CLASS (operation);
+
+  GeglBufferClIterator *iter = NULL;
+
+  gboolean err;
+
+  /* non-texturizable format! */
+  if (!gegl_cl_color_babl (in_format,  NULL) ||
+      !gegl_cl_color_babl (out_format, NULL))
+    {
+      GEGL_NOTE (GEGL_DEBUG_OPENCL, "Non-texturizable format!");
+      return FALSE;
+    }
+
+  GEGL_NOTE (GEGL_DEBUG_OPENCL, "GEGL_OPERATION_COMPOSER_FILTER: %s", operation_class->name);
+
+  /* Process */
+  iter = gegl_buffer_cl_iterator_new (output, result, out_format, GEGL_CL_BUFFER_WRITE);
+
+  gegl_buffer_cl_iterator_add (iter, input, result, in_format, GEGL_CL_BUFFER_READ, GEGL_ABYSS_NONE);
+  if(aux)
+    gegl_buffer_cl_iterator_add (iter, aux, result, aux_format, GEGL_CL_BUFFER_READ, GEGL_ABYSS_NONE);
+
+  while (gegl_buffer_cl_iterator_next (iter, &err))
+    {
+      if (err)
+        return FALSE;
+
+      if (point_composer_class->cl_process)
+        {
+          err = point_composer_class->cl_process (operation, iter->tex[1], iter->tex[2], iter->tex[0],
+                                                  iter->size[0], &iter->roi[0], level);
+          if (err)
+            {
+              GEGL_NOTE (GEGL_DEBUG_OPENCL, "Error: %s", operation_class->name);
+              gegl_buffer_cl_iterator_stop (iter);
+              return FALSE;
+            }
+        }
+      else
+        {
+          g_warning ("OpenCL support enabled, but no way to execute");
+          gegl_buffer_cl_iterator_stop (iter);
+          return FALSE;
+        }
+    }
+
+  return TRUE;
+}
+
 static void
 gegl_operation_point_composer_class_init (GeglOperationPointComposerClass *klass)
 {
@@ -207,6 +274,7 @@ gegl_operation_point_composer_process (GeglOperation       *operation,
                                        const GeglRectangle *result,
                                        gint                 level)
 {
+  GeglOperationClass *operation_class = GEGL_OPERATION_GET_CLASS (operation);
   GeglOperationPointComposerClass *point_composer_class = GEGL_OPERATION_POINT_COMPOSER_GET_CLASS (operation);
   const Babl *in_format   = gegl_operation_get_format (operation, "input");
   const Babl *aux_format  = gegl_operation_get_format (operation, "aux");
@@ -218,6 +286,12 @@ gegl_operation_point_composer_process (GeglOperation       *operation,
       const Babl *in_buf_format  = input?gegl_buffer_get_format(input):NULL;
       const Babl *aux_buf_format = aux?gegl_buffer_get_format(aux):NULL;
       const Babl *output_buf_format = output?gegl_buffer_get_format(output):NULL;
+
+      if (gegl_operation_use_opencl (operation) && (operation_class->cl_data || point_composer_class->cl_process))
+      {
+        if (gegl_operation_point_composer_cl_process (operation, input, aux, output, result, level))
+            return TRUE;
+      }
 
       if (gegl_operation_use_threading (operation, result) && result->height > 1)
       {

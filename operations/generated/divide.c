@@ -53,6 +53,71 @@ static void prepare (GeglOperation *operation)
   gegl_operation_set_format (operation, "output", format);
 }
 
+#include "opencl/gegl-cl.h"
+#include "opencl/divide.cl.h"
+
+static GeglClRunData *cl_data = NULL;
+
+static gboolean
+cl_process (GeglOperation       *op,
+            cl_mem               in_tex,
+            cl_mem               aux_tex,
+            cl_mem               out_tex,
+            size_t               global_worksize,
+            const GeglRectangle *roi,
+            gint                 level)
+{
+  gint cl_err = 0;
+
+  if (!cl_data)
+    {
+      const char *kernel_name[] = {"kernel_divide",
+                                   "kernel_divide_aux",
+                                   NULL};
+      cl_data = gegl_cl_compile_and_build (divide_cl_source,
+                                           kernel_name);
+    }
+  if (!cl_data) return TRUE;
+
+
+  if (!aux_tex)
+    {
+      gfloat value = GEGL_PROPERTIES (op)->value;
+      cl_err = gegl_clSetKernelArg(cl_data->kernel[0], 0, sizeof(cl_mem), (void*)&in_tex);
+      CL_CHECK;
+      cl_err = gegl_clSetKernelArg(cl_data->kernel[0], 1, sizeof(cl_mem), (void*)&out_tex);
+      CL_CHECK;
+      cl_err = gegl_clSetKernelArg(cl_data->kernel[0], 2, sizeof(cl_float), &value);
+      CL_CHECK;
+
+      cl_err = gegl_clEnqueueNDRangeKernel(gegl_cl_get_command_queue (),
+                                           cl_data->kernel[0], 1,
+                                           NULL, &global_worksize, NULL,
+                                           0, NULL, NULL);
+      CL_CHECK;
+    }
+  else
+    {
+      cl_err = gegl_clSetKernelArg(cl_data->kernel[1], 0, sizeof(cl_mem), (void*)&in_tex);
+      CL_CHECK;
+      cl_err = gegl_clSetKernelArg(cl_data->kernel[1], 1, sizeof(cl_mem), (void*)&out_tex);
+      CL_CHECK;
+      cl_err = gegl_clSetKernelArg(cl_data->kernel[1], 2, sizeof(cl_mem), (void*)&aux_tex);
+      CL_CHECK;
+
+      cl_err = gegl_clEnqueueNDRangeKernel(gegl_cl_get_command_queue (),
+                                           cl_data->kernel[1], 1,
+                                           NULL, &global_worksize, NULL,
+                                           0, NULL, NULL);
+      CL_CHECK;
+    }
+
+  return FALSE;
+
+error:
+  return TRUE;
+}
+
 static gboolean
 process (GeglOperation       *op,
          void                *in_buf,
@@ -119,7 +184,9 @@ gegl_op_class_init (GeglOpClass *klass)
   point_composer_class     = GEGL_OPERATION_POINT_COMPOSER_CLASS (klass);
 
   point_composer_class->process = process;
+  operation_class->opencl_support = TRUE;
   operation_class->prepare = prepare;
+  point_composer_class->cl_process = cl_process;
 
   gegl_operation_class_set_keys (operation_class,
   "name"        , "gegl:divide",
@@ -127,7 +194,7 @@ gegl_op_class_init (GeglOpClass *klass)
   "categories"  , "compositors:math",
   "reference-hash"  , "c3bd84f8a6b2c03a239f3f832597592c",
   "description" ,
-       _("Math operation divide, performs the operation per pixel, using either the constant provided in 'value' or the corresponding pixel from the buffer on aux as operands. (formula: result = value==0.0f?0.0f:input/value)"),
+       _("Math operation divide, performs the operation per pixel, using either the constant provided in 'value' or the corresponding pixel from the buffer on aux as operands. The result is the evaluation of the expression result = value==0.0f?0.0f:input/value"),
        NULL);
 }
 #endif
